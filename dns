@@ -1,0 +1,178 @@
+#!/bin/bash
+# /usr/local/bin/dns
+# DNS Manager for grandedata.no
+# Manage subdomains and keep IP automatically updated via the Domeneshop API
+
+TOKEN="your_token"
+SECRET="your_secret"
+DOMAIN="your_domain"
+API="https://api.domeneshop.no/v0"
+AUTH="${TOKEN}:${SECRET}"
+CACHE_FILE="/var/cache/ddns_last_ip"
+LOG_FILE="/var/log/ddns-update.log"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG_FILE"; }
+
+usage() {
+  echo "Usage:"
+  echo "  dns list                 List all A records"
+  echo "  dns create <subdomain>   Create a new subdomain"
+  echo "  dns delete <subdomain>   Delete a subdomain"
+  exit 1
+}
+
+get_domain_id() {
+  curl -s -u "$AUTH" "${API}/domains" | python3 -c "
+import json, sys
+for d in json.load(sys.stdin):
+    if d['domain'] == '${DOMAIN}':
+        print(d['id'])
+        break
+"
+}
+
+get_record_id() {
+  local domain_id=$1
+  local host=$2
+  curl -s -u "$AUTH" "${API}/domains/${domain_id}/dns?type=A&host=${host}" | python3 -c "
+import json, sys
+records = json.load(sys.stdin)
+if records:
+    print(records[0]['id'])
+"
+}
+
+get_ip() {
+  curl -s --max-time 10 https://api.ipify.org
+}
+
+# ── DDNS update (run by cron every 5 minutes) ──
+ddns_update() {
+  CURRENT_IP=$(get_ip)
+  if [[ -z "$CURRENT_IP" ]]; then log "ERROR: Could not fetch external IP"; exit 1; fi
+
+  LAST_IP=$(cat "$CACHE_FILE" 2>/dev/null)
+  if [[ "$CURRENT_IP" == "$LAST_IP" && "$1" != "force" ]]; then exit 0; fi
+
+  log "IP changed: ${LAST_IP:-unknown} -> ${CURRENT_IP}"
+
+  DOMAINS=$(curl -s -u "$AUTH" "${API}/domains" | python3 -c "
+import json, sys
+for d in json.load(sys.stdin):
+    if d.get('services', {}).get('dns'):
+        print(d['id'], d['domain'])
+")
+
+  if [[ -z "$DOMAINS" ]]; then log "ERROR: No domains found"; exit 1; fi
+
+  while read -r DOMAIN_ID DOMAIN_NAME; do
+    curl -s -u "$AUTH" "${API}/domains/${DOMAIN_ID}/dns?type=A" | python3 -c "
+import json, sys
+for r in json.load(sys.stdin):
+    print(r['id'], r['host'])
+" | while read -r RECORD_ID HOST; do
+      FQDN=$([[ "$HOST" == "@" ]] && echo "$DOMAIN_NAME" || echo "${HOST}.${DOMAIN_NAME}")
+      CODE=$(curl -s -o /dev/null -w "%{http_code}" -u "$AUTH" -X PUT \
+        -H "Content-Type: application/json" \
+        -d "{\"host\":\"${HOST}\",\"type\":\"A\",\"data\":\"${CURRENT_IP}\",\"ttl\":3600}" \
+        "${API}/domains/${DOMAIN_ID}/dns/${RECORD_ID}")
+      [[ "$CODE" == "204" ]] && log "OK: ${FQDN} -> ${CURRENT_IP}" || log "ERROR: ${FQDN} (HTTP ${CODE})"
+    done
+  done <<< "$DOMAINS"
+
+  echo "$CURRENT_IP" > "$CACHE_FILE"
+  log "Done."
+}
+
+# ── Get domain ID ──
+ACTION=$1
+SUBDOMAIN=$2
+
+if [[ -z "$ACTION" ]]; then usage; fi
+
+# Cron runs ddns_update directly
+if [[ "$ACTION" == "--ddns" ]]; then
+  ddns_update
+  exit 0
+fi
+
+DOMAIN_ID=$(get_domain_id)
+if [[ -z "$DOMAIN_ID" ]]; then
+  echo "Error: Could not find domain '$DOMAIN' on the account"
+  exit 1
+fi
+
+case "$ACTION" in
+  list)
+    echo ""
+    echo "A records for ${DOMAIN}:"
+    echo "─────────────────────────────────────────────"
+    curl -s -u "$AUTH" "${API}/domains/${DOMAIN_ID}/dns?type=A" | python3 -c "
+import json, sys
+records = json.load(sys.stdin)
+if not records:
+    print('  No A records found')
+else:
+    for r in records:
+        host = r['host']
+        fqdn = '${DOMAIN}' if host == '@' else f\"{host}.${DOMAIN}\"
+        print(f\"  {fqdn:<40} {r['data']}\")
+"
+    echo ""
+    ;;
+
+  create)
+    if [[ -z "$SUBDOMAIN" ]]; then usage; fi
+
+    EXISTING=$(get_record_id "$DOMAIN_ID" "$SUBDOMAIN")
+    if [[ -n "$EXISTING" ]]; then
+      echo "Subdomain ${SUBDOMAIN}.${DOMAIN} already exists"
+      exit 0
+    fi
+
+    IP=$(get_ip)
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -u "$AUTH" -X POST \
+      -H "Content-Type: application/json" \
+      -d "{\"host\":\"${SUBDOMAIN}\",\"type\":\"A\",\"data\":\"${IP}\",\"ttl\":3600}" \
+      "${API}/domains/${DOMAIN_ID}/dns")
+
+    if [[ "$CODE" == "201" ]]; then
+      echo "✓ Created ${SUBDOMAIN}.${DOMAIN} -> ${IP}"
+      log "Created ${SUBDOMAIN}.${DOMAIN} -> ${IP}"
+    else
+      echo "Error: Could not create record (HTTP ${CODE})"
+    fi
+    ;;
+
+  delete)
+    if [[ -z "$SUBDOMAIN" ]]; then usage; fi
+
+    RECORD_ID=$(get_record_id "$DOMAIN_ID" "$SUBDOMAIN")
+    if [[ -z "$RECORD_ID" ]]; then
+      echo "Could not find ${SUBDOMAIN}.${DOMAIN}"
+      exit 1
+    fi
+
+    read -p "Are you sure you want to delete ${SUBDOMAIN}.${DOMAIN}? [y/N] " CONFIRM
+    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+      echo "Cancelled"
+      exit 0
+    fi
+
+    CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+      -u "$AUTH" -X DELETE \
+      "${API}/domains/${DOMAIN_ID}/dns/${RECORD_ID}")
+
+    if [[ "$CODE" == "204" ]]; then
+      echo "✓ Deleted ${SUBDOMAIN}.${DOMAIN}"
+      log "Deleted ${SUBDOMAIN}.${DOMAIN}"
+    else
+      echo "Error: Could not delete record (HTTP ${CODE})"
+    fi
+    ;;
+
+  *)
+    usage
+    ;;
+esac
